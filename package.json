@@ -6,6 +6,7 @@
   "scripts": {
     "test": "npm run build && node --test dist/test/auth-username.test.js",
     "dev": "tsx watch server.ts",
+    "register": "npm run build && node dist/register.js",
     "build": "tsc",
     "start": "node dist/server.js"
   },

@@ -24,6 +24,14 @@ npm run dev
 
 El servidor escucha en el puerto indicado por `PORT` (3000 por defecto). `GET /health` devuelve el estado del servicio y las rutas de autenticación están bajo `/api/auth`.
 
+## Registrar un usuario desde la terminal
+
+```powershell
+npm run register
+```
+
+El comando pide nombre, correo y contraseña (la contraseña no se muestra mientras se escribe). No es necesario iniciar el servidor web. Usa la base de datos configurada en `SQLITE_PATH`.
+
 ## Compilar y probar
 
 ```powershell
