@@ -5,6 +5,7 @@ import { APIError } from "better-auth/api";
 import { bearer } from "better-auth/plugins";
 import {
   ensureUniqueUsernameIndex,
+  isValidUsername,
   normalizeUsername,
   registerUsernameNormalizer,
   usernameIsTaken,
@@ -57,10 +58,10 @@ export const auth = betterAuth({
       create: {
         before: async (user) => {
           const name = user.name.trim();
-          const normalizedName = normalizeUsername(name);
-          if (normalizedName.length < 2 || normalizedName.length > 32) {
+          if (!isValidUsername(name)) {
             throw new APIError("BAD_REQUEST", {
-              message: "El nombre de usuario debe tener entre 2 y 32 caracteres.",
+              message:
+                "El nombre debe tener entre 2 y 32 caracteres y usar solo letras, números, espacios, guiones o apóstrofes.",
             });
           }
 

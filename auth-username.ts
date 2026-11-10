@@ -1,7 +1,20 @@
 import type { DatabaseSync } from "node:sqlite";
 
+const USERNAME_PATTERN =
+  /^[\p{L}\p{N}][\p{L}\p{M}\p{N}]*(?:[ '\u2019-][\p{L}\p{N}][\p{L}\p{M}\p{N}]*)*$/u;
+
 export function normalizeUsername(name: string): string {
   return name.trim().normalize("NFKC").toLowerCase();
+}
+
+export function isValidUsername(name: string): boolean {
+  const normalized = normalizeUsername(name);
+  const characterCount = Array.from(normalized).length;
+  return (
+    characterCount >= 2 &&
+    characterCount <= 32 &&
+    USERNAME_PATTERN.test(normalized)
+  );
 }
 
 export function registerUsernameNormalizer(database: DatabaseSync): void {
