@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "npm run build && node --test dist/test/auth-username.test.js",
+    "test": "npm run build && node --test dist/test/auth-username.test.js dist/test/multiplayer.test.js",
     "dev": "tsx watch server.ts",
     "register": "npm run build && node dist/register.js",
     "build": "tsc",
