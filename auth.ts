@@ -1,8 +1,9 @@
 import "dotenv/config";
 import { DatabaseSync } from "node:sqlite";
 import { betterAuth } from "better-auth";
-import { APIError } from "better-auth/api";
-import { bearer } from "better-auth/plugins";
+import { APIError, createAuthMiddleware } from "better-auth/api";
+import { getMigrations } from "better-auth/db/migration";
+import { bearer, username } from "better-auth/plugins";
 import {
   ensureUniqueUsernameIndex,
   isValidUsername,
@@ -41,7 +42,7 @@ export const auth = betterAuth({
   trustedOrigins,
   emailAndPassword: {
     enabled: true,
-    minPasswordLength: 12,
+    minPasswordLength: 6,
     maxPasswordLength: 128,
   },
   rateLimit: {
@@ -50,6 +51,7 @@ export const auth = betterAuth({
     max: 100,
     customRules: {
       "/sign-in/email": { window: 15 * 60, max: 8 },
+      "/sign-in/username": { window: 15 * 60, max: 8 },
       "/sign-up/email": { window: 60 * 60, max: 5 },
     },
   },
@@ -80,5 +82,58 @@ export const auth = betterAuth({
   user: {
     deleteUser: { enabled: true },
   },
-  plugins: [bearer()],
+  plugins: [
+    bearer(),
+    username({
+      minUsernameLength: 2,
+      maxUsernameLength: 32,
+      usernameValidator: isValidUsername,
+      usernameNormalization: normalizeUsername,
+      displayUsername: false,
+      immutableUsername: true,
+    }),
+    {
+      id: "brilliant-registration",
+      hooks: {
+        before: [{
+          matcher: (context) => context.path === "/sign-up/email",
+          handler: createAuthMiddleware(async (context) => {
+            const { name, username: login, password } = context.body;
+            if (typeof name !== "string" || typeof login !== "string" ||
+                normalizeUsername(name) !== normalizeUsername(login)) {
+              throw new APIError("BAD_REQUEST", { message: "El nombre de usuario no es válido." });
+            }
+            if (typeof password !== "string" || !/^[0-9]{6}$/.test(password)) {
+              throw new APIError("BAD_REQUEST", { message: "El PIN debe contener exactamente 6 dígitos." });
+            }
+          }),
+        }],
+      },
+    },
+  ],
 });
+
+export async function initializeDatabase(): Promise<void> {
+  const table = database.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1",
+  ).get();
+  if (!table) {
+    const migrations = await getMigrations(auth.options);
+    await migrations.runMigrations();
+  } else {
+    const columns = database.prepare("PRAGMA table_info(user)").all();
+    if (!columns.some((column) => column.name === "username")) {
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        ensureUniqueUsernameIndex(database);
+        database.exec("ALTER TABLE user ADD COLUMN username TEXT");
+        database.exec("UPDATE user SET username = normalize_user_name(name)");
+        database.exec("CREATE UNIQUE INDEX user_username_unique ON user(username)");
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    }
+  }
+}

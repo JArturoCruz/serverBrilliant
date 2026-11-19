@@ -16,16 +16,21 @@ interface Player {
   lastSeenAt: number;
   board: Board;
   ready: boolean;
+  lobbyReady: boolean;
   score: number;
   forfeited: boolean;
   completedRegions: Set<string>;
   playedThisRound: boolean;
+  noLegalMove: boolean;
 }
 
 interface RoomEvent {
   id: string;
   message: string;
   createdAt: string;
+  playerId?: string;
+  region?: string;
+  round?: number;
 }
 
 interface BoardRules {
@@ -53,6 +58,10 @@ interface Room {
   events: RoomEvent[];
   createdAt: number;
   finishedAt: number | null;
+  nextAutoRoundAt: number | null;
+  kickCounts: Map<string, number>;
+  blockedPlayers: Set<string>;
+  removedPlayers: Map<string, string>;
 }
 
 interface ClosedRoom {
@@ -74,7 +83,10 @@ export interface RoomSnapshot {
     forfeited: boolean;
     isWinner: boolean;
     ready: boolean;
+    lobbyReady: boolean;
     playedThisRound: boolean;
+    noLegalMove: boolean;
+    board: Board | null;
   }>;
   board: Board;
   dice: [number, number] | null;
@@ -255,6 +267,10 @@ export class MultiplayerService {
       events: [],
       createdAt: this.now(),
       finishedAt: null,
+      nextAutoRoundAt: null,
+      kickCounts: new Map(),
+      blockedPlayers: new Set(),
+      removedPlayers: new Map(),
     };
     this.rooms.set(code, room);
     this.roomByPlayer.set(user.id, code);
@@ -279,10 +295,14 @@ export class MultiplayerService {
     if (!room || room.phase !== "waiting") {
       throw new MultiplayerError("ROOM_NOT_FOUND", "La sala no existe o ya comenzó.", 404);
     }
+    if (room.blockedPlayers.has(user.id)) {
+      throw new MultiplayerError("ROOM_BLOCKED", "El anfitrión te bloqueó de esta sala.", 403);
+    }
     if (room.players.filter((player) => !player.forfeited).length >= 6) {
       throw new MultiplayerError("ROOM_FULL", "La sala ya tiene 6 jugadores.", 409);
     }
     room.players.push(this.newPlayer(user, false));
+    room.removedPlayers.delete(user.id);
     this.roomByPlayer.set(user.id, code);
     room.revision++;
     this.addEvent(room, `${user.name} se unió a la sala.`);
@@ -300,6 +320,14 @@ export class MultiplayerService {
         throw new MultiplayerError("ROOM_DISSOLVED", closed.message, 410);
       }
       throw new MultiplayerError("ROOM_NOT_FOUND", "La sala ya no está disponible.", 404);
+    }
+    const removalMessage = room.removedPlayers.get(user.id);
+    if (removalMessage) {
+      throw new MultiplayerError(
+        room.blockedPlayers.has(user.id) ? "ROOM_BLOCKED" : "ROOM_KICKED",
+        removalMessage,
+        403,
+      );
     }
     const player = this.requireMember(room, user.id);
     player.lastSeenAt = this.now();
@@ -327,10 +355,65 @@ export class MultiplayerService {
         409,
       );
     }
+    if (players.some((player) => !player.lobbyReady)) {
+      throw new MultiplayerError("PLAYERS_NOT_READY", "Todos los jugadores deben estar listos.", 409);
+    }
     room.phase = "setup";
     room.playerCountAtStart = players.length;
     room.revision++;
     this.addEvent(room, `${user.name} inició la partida.`);
+    return this.snapshot(room, user.id);
+  }
+
+  setReady(user: MultiplayerUser, suppliedCode: string, ready: boolean): RoomSnapshot {
+    this.sweep();
+    const room = this.requireRoom(suppliedCode);
+    this.touchRoomMember(room, user);
+    if (room.phase !== "waiting") {
+      throw new MultiplayerError("ROOM_ALREADY_STARTED", "La partida ya comenzó.", 409);
+    }
+    const player = this.requireMember(room, user.id);
+    if (player.lobbyReady !== ready) {
+      player.lobbyReady = ready;
+      room.revision++;
+    }
+    return this.snapshot(room, user.id);
+  }
+
+  removeRoomPlayer(
+    user: MultiplayerUser,
+    suppliedCode: string,
+    targetId: string,
+    block: boolean,
+  ): RoomSnapshot {
+    this.sweep();
+    const room = this.requireRoom(suppliedCode);
+    this.touchRoomMember(room, user);
+    if (room.hostId !== user.id) {
+      throw new MultiplayerError("HOST_ONLY", "Solo el anfitrión puede expulsar jugadores.", 403);
+    }
+    if (room.phase !== "waiting") {
+      throw new MultiplayerError("ROOM_ALREADY_STARTED", "Solo puedes expulsar jugadores antes de iniciar.", 409);
+    }
+    if (targetId === room.hostId) {
+      throw new MultiplayerError("INVALID_TARGET", "El anfitrión no puede expulsarse.", 400);
+    }
+    const target = room.players.find((player) => player.id === targetId);
+    if (!target) {
+      throw new MultiplayerError("PLAYER_NOT_FOUND", "El jugador ya no está en la sala.", 404);
+    }
+    const count = (room.kickCounts.get(targetId) ?? 0) + 1;
+    room.kickCounts.set(targetId, count);
+    const blocked = block || count >= 3;
+    if (blocked) room.blockedPlayers.add(targetId);
+    const message = blocked
+      ? "El anfitrión te expulsó y bloqueó de esta sala."
+      : "El anfitrión te expulsó de esta sala.";
+    room.removedPlayers.set(targetId, message);
+    this.removePlayer(room, target);
+    this.addEvent(room, blocked
+      ? `${target.name} fue expulsado y bloqueado de la sala.`
+      : `${target.name} fue expulsado de la sala.`);
     return this.snapshot(room, user.id);
   }
 
@@ -467,6 +550,8 @@ export class MultiplayerService {
           this.addEvent(
             room,
             `${user.name} completó ${regionName}: recompensa ${position}${sharedThisRound ? " compartida en esta ronda" : ""} (${points} puntos).`,
+            undefined,
+            { playerId: user.id, region: regionName, round: room.round },
           );
         }
       }
@@ -544,10 +629,12 @@ export class MultiplayerService {
     }
     if (room.phase === "playing") {
       this.forfeit(room, player, player.isHost ? "host_forfeit" : "player_forfeit");
+      this.advanceRoundWhenComplete(room);
       return { dissolved: false, room: this.snapshot(room, user.id) };
     }
-    this.roomByPlayer.delete(player.id);
-    player.forfeited = true;
+    if (this.roomByPlayer.get(player.id) === room.code) {
+      this.roomByPlayer.delete(player.id);
+    }
     return { dissolved: false, room: this.snapshot(room, user.id) };
   }
 
@@ -598,6 +685,9 @@ export class MultiplayerService {
           this.startNextRound(room);
         }
       }
+      if (room.phase === "playing" && room.nextAutoRoundAt !== null && at >= room.nextAutoRoundAt) {
+        this.advanceRoundWhenComplete(room);
+      }
     }
     for (const [code, room] of this.closedRooms) {
       if (room.expiresAt <= at) this.closedRooms.delete(code);
@@ -619,6 +709,7 @@ export class MultiplayerService {
 
   private startNextRound(room: Room): void {
     if (room.phase !== "playing") return;
+    room.nextAutoRoundAt = null;
     const players = room.players.filter((player) => !player.forfeited);
     if (players.length === 0) {
       this.finish(room, players.map((player) => player.id), "forfeit");
@@ -629,7 +720,8 @@ export class MultiplayerService {
     room.revision++;
     let playersWithMoves = 0;
     for (const player of players) {
-      player.playedThisRound = !this.hasLegalMove(room, player);
+      player.noLegalMove = !this.hasLegalMove(room, player);
+      player.playedThisRound = player.noLegalMove;
       if (player.playedThisRound) {
         this.addEvent(
           room,
@@ -640,9 +732,20 @@ export class MultiplayerService {
       }
     }
     if (playersWithMoves > 0) return;
-    const highScore = Math.max(...players.map((player) => player.score));
-    const winners = players.filter((player) => player.score === highScore).map((player) => player.id);
-    this.finish(room, winners, "no_moves");
+    const anyPossibleMove = players.some((player) =>
+      Array.from({ length: 6 }, (_, index) => index + 1).some((first) =>
+        Array.from({ length: 6 }, (_, index) => index + 1).some((second) =>
+          this.hasLegalMove(room, player, [first, second]),
+        ),
+      ),
+    );
+    if (!anyPossibleMove) {
+      const highScore = Math.max(...players.map((player) => player.score));
+      const winners = players.filter((player) => player.score === highScore).map((player) => player.id);
+      this.finish(room, winners, "no_moves");
+    } else {
+      room.nextAutoRoundAt = this.now() + 3_000;
+    }
   }
 
   private allPlayersCompletedRound(room: Room): boolean {
@@ -654,6 +757,10 @@ export class MultiplayerService {
     const players = room.players.filter((player) => !player.forfeited);
     if (players.length === 0) {
       this.finish(room, [], "forfeit");
+      return;
+    }
+    if (players.length === 1) {
+      this.finish(room, [players[0].id], "last_player");
       return;
     }
     if (!this.allPlayersCompletedRound(room)) return;
@@ -669,8 +776,7 @@ export class MultiplayerService {
     this.startNextRound(room);
   }
 
-  private hasLegalMove(room: Room, player: Player): boolean {
-    const dice = room.dice!;
+  private hasLegalMove(room: Room, player: Player, dice = room.dice!): boolean {
     for (let row = 0; row < 7; row++) {
       for (let column = 0; column < 7; column++) {
         for (const anchorDieIndex of [0, 1]) {
@@ -735,7 +841,11 @@ export class MultiplayerService {
     room.revision++;
     const names = room.players.filter((player) => winners.includes(player.id)).map((player) => player.name);
     this.addEvent(room, names.length > 0 ? `Partida finalizada. Ganador(es): ${names.join(", ")}.` : "La partida finalizó sin ganador.");
-    for (const player of room.players) this.roomByPlayer.delete(player.id);
+    for (const player of room.players) {
+      if (this.roomByPlayer.get(player.id) === room.code) {
+        this.roomByPlayer.delete(player.id);
+      }
+    }
   }
 
   private forfeit(room: Room, player: Player, reason: string): void {
@@ -759,7 +869,11 @@ export class MultiplayerService {
 
   private closeRoom(room: Room, message: string): void {
     this.addEvent(room, message);
-    for (const player of room.players) this.roomByPlayer.delete(player.id);
+    for (const player of room.players) {
+      if (this.roomByPlayer.get(player.id) === room.code) {
+        this.roomByPlayer.delete(player.id);
+      }
+    }
     this.rooms.delete(room.code);
     this.closedRooms.set(room.code, { message, expiresAt: this.now() + ROOM_RETENTION_MS });
   }
@@ -787,10 +901,12 @@ export class MultiplayerService {
       lastSeenAt: this.now(),
       board: EMPTY_BOARD(),
       ready: false,
+      lobbyReady: false,
       score: 0,
       forfeited: false,
       completedRegions: new Set<string>(),
       playedThisRound: false,
+      noLegalMove: false,
     };
   }
 
@@ -845,8 +961,13 @@ export class MultiplayerService {
     return !player.forfeited && this.now() - player.lastSeenAt <= PRESENCE_STALE_MS;
   }
 
-  private addEvent(room: Room, message: string, id: string = randomUUID()): void {
-    room.events.push({ id, message, createdAt: new Date(this.now()).toISOString() });
+  private addEvent(
+    room: Room,
+    message: string,
+    id: string = randomUUID(),
+    completion?: { playerId: string; region: string; round: number },
+  ): void {
+    room.events.push({ id, message, createdAt: new Date(this.now()).toISOString(), ...completion });
     if (room.events.length > 30) room.events.splice(0, room.events.length - 30);
   }
 
@@ -867,7 +988,12 @@ export class MultiplayerService {
         forfeited: player.forfeited,
         isWinner: room.winners.includes(player.id),
         ready: player.ready,
+        lobbyReady: player.lobbyReady,
         playedThisRound: player.playedThisRound,
+        noLegalMove: player.noLegalMove,
+        board: room.phase === "playing" || room.phase === "finished"
+          ? player.board.map((row) => [...row])
+          : null,
       })),
       board: player.board.map((row) => [...row]),
       dice: room.dice ? [...room.dice] as [number, number] : null,

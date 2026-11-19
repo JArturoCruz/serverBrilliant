@@ -27,6 +27,7 @@ function startAndConfigure(
   players: MultiplayerUser[],
   mapId: number,
 ): RoomSnapshot {
+  for (const player of players) service.setReady(player, code, true);
   service.startRoom(host, code);
   const values = mapId === 4 ? [4, 1, 2, 6, 5, 3] : [1, 2, 3, 4, 5, 6];
   let room: RoomSnapshot | undefined;
@@ -104,9 +105,10 @@ const map4BluePath: Array<{
 function createMap4ScoringRoom(
   players: MultiplayerUser[],
 ): { service: MultiplayerService; code: string } {
+  let codeValue = 0;
   const service = new MultiplayerService(
     Date.now,
-    (max) => (max === 6 ? 0 : 0),
+    (max) => (max === 6 ? 0 : codeValue++ % max),
   );
   const waiting = service.createRoom(players[0], 4);
   for (const player of players.slice(1)) service.joinRoom(player, waiting.code);
@@ -135,6 +137,43 @@ test("uses the requested score thresholds for rooms of two through six players",
   assert.deepEqual([2, 3, 4, 5, 6].map(scoreToWin), [26, 24, 22, 20, 18]);
   expectCode(() => scoreToWin(1), "INVALID_PLAYER_COUNT");
   expectCode(() => scoreToWin(7), "INVALID_PLAYER_COUNT");
+});
+
+test("waits and rolls another round when both dice are unusable but other rolls remain possible", () => {
+  let now = 0;
+  let dice = [0, 0];
+  let dieIndex = 0;
+  const service = new MultiplayerService(() => now, (max) => max === 6 ? dice[dieIndex++ % 2] : 0);
+  const waiting = service.createRoom(users[0], 4);
+  service.joinRoom(users[1], waiting.code);
+  let room = startAndConfigure(service, users[0], waiting.code, users.slice(0, 2), 4);
+  for (let count = 0; count < 49 && room.phase === "playing"; count++) {
+    if (room.players.every((player) => player.noLegalMove)) break;
+    for (const user of users.slice(0, 2)) {
+      room = service.getRoom(user, waiting.code);
+      if (!room.players.find((player) => player.id === user.id)!.playedThisRound) {
+        room = makeFirstValidMove(service, user, room);
+      }
+    }
+  }
+  assert.equal(room.phase, "playing");
+  assert.ok(room.players.every((player) => player.noLegalMove));
+  const skippedRound = room.round;
+  now += 2_999;
+  assert.equal(service.getRoom(users[0], waiting.code).round, skippedRound);
+  now += 1;
+  room = service.getRoom(users[0], waiting.code);
+  assert.equal(room.phase, "playing");
+  assert.equal(room.round, skippedRound + 1);
+  for (let first = 0; first < 6 && room.players.every((player) => player.noLegalMove); first++) {
+    for (let second = 0; second < 6 && room.players.every((player) => player.noLegalMove); second++) {
+      service.getRoom(users[1], waiting.code);
+      dice = [first, second];
+      now += 3_000;
+      room = service.getRoom(users[0], waiting.code);
+    }
+  }
+  assert.ok(room.players.some((player) => !player.noLegalMove));
 });
 
 test("keeps multiplayer region scoring aligned with all four board maps", () => {
@@ -239,12 +278,13 @@ test("keeps the second region reward available for the next completion round", (
 });
 
 test("keeps an abandoned player's completed-zone reward permanently claimed", () => {
-  const players = users.slice(0, 2);
+  const players = users.slice(0, 3);
   const { service, code } = createMap4ScoringRoom(players);
 
   for (const move of map4BluePath) {
     performMap4RoundAction(service, players[0], code, move);
     performMap4RoundAction(service, players[1], code, null);
+    performMap4RoundAction(service, players[2], code, null);
   }
 
   const beforeLeaving = service.getRoom(players[0], code);
@@ -268,6 +308,7 @@ test("keeps an abandoned player's completed-zone reward permanently claimed", ()
 
   for (const move of map4BluePath) {
     performMap4RoundAction(service, players[1], code, move);
+    performMap4RoundAction(service, players[2], code, null);
   }
   const afterCompletion = service.getRoom(players[1], code);
   assert.equal(afterCompletion.phase, "playing");
@@ -282,6 +323,32 @@ test("keeps an abandoned player's completed-zone reward permanently claimed", ()
   );
 });
 
+test("the last player wins immediately despite a lower score and retains all final boards", () => {
+  const players = users.slice(0, 2);
+  const { service, code } = createMap4ScoringRoom(players);
+  for (const move of map4BluePath) {
+    performMap4RoundAction(service, players[0], code, move);
+    performMap4RoundAction(service, players[1], code, null);
+  }
+  const before = service.getRoom(players[1], code);
+  assert.deepEqual(before.players.map((player) => player.score), [8, 0]);
+
+  service.leaveRoom(players[0], code);
+  const finished = service.getRoom(players[1], code);
+  assert.equal(finished.phase, "finished");
+  assert.equal(finished.finishReason, "last_player");
+  assert.deepEqual(finished.winners, [players[1].id]);
+  assert.deepEqual(finished.players.map((player) => player.score), [8, 0]);
+  assert.deepEqual(finished.players.map((player) => player.board), before.players.map((player) => player.board));
+
+  const newRoom = service.createRoom(players[0], 1);
+  service.leaveRoom(players[0], code);
+  expectCode(() => service.createRoom(players[0], 1), "ALREADY_IN_ROOM");
+  assert.equal(service.getRoom(players[0], newRoom.code).phase, "waiting");
+  const left = service.leaveRoom(players[1], code).room!;
+  assert.equal(left.players.find((player) => player.id === players[1].id)?.forfeited, false);
+});
+
 test("creates private invite codes and enforces host, capacity, and membership rules", () => {
   const service = createService();
   const room = service.createRoom(users[0], 1);
@@ -293,6 +360,56 @@ test("creates private invite codes and enforces host, capacity, and membership r
   for (const user of users.slice(1, 6)) service.joinRoom(user, room.code);
   expectCode(() => service.joinRoom(users[6], room.code), "ROOM_FULL");
   assert.equal(service.getRoom(users[0], room.code).players.length, 6);
+});
+
+test("requires every connected player, including the host, to be ready before starting", () => {
+  const service = createService();
+  const waiting = service.createRoom(users[0], 1);
+  service.joinRoom(users[1], waiting.code);
+  expectCode(() => service.startRoom(users[0], waiting.code), "PLAYERS_NOT_READY");
+  service.setReady(users[1], waiting.code, true);
+  expectCode(() => service.startRoom(users[0], waiting.code), "PLAYERS_NOT_READY");
+  let room = service.setReady(users[0], waiting.code, true);
+  assert.ok(room.players.every((player) => player.lobbyReady));
+  room = service.setReady(users[1], waiting.code, false);
+  assert.equal(room.players[1].lobbyReady, false);
+  expectCode(() => service.startRoom(users[0], waiting.code), "PLAYERS_NOT_READY");
+  service.setReady(users[1], waiting.code, true);
+  room = service.startRoom(users[0], waiting.code);
+  assert.equal(room.phase, "setup");
+  assert.ok(room.players.every((player) => !player.ready));
+  expectCode(() => service.setReady(users[0], waiting.code, false), "ROOM_ALREADY_STARTED");
+});
+
+test("only the host can expel or block waiting players and the third expulsion blocks reentry", () => {
+  const service = createService();
+  const room = service.createRoom(users[0], 1);
+  service.joinRoom(users[1], room.code);
+  service.setReady(users[1], room.code, true);
+  expectCode(() => service.removeRoomPlayer(users[1], room.code, users[0].id, false), "HOST_ONLY");
+  expectCode(() => service.removeRoomPlayer(users[0], room.code, users[0].id, false), "INVALID_TARGET");
+  for (let count = 1; count <= 3; count++) {
+    const updated = service.removeRoomPlayer(users[0], room.code, users[1].id, false);
+    assert.equal(updated.players.length, 1);
+    expectCode(() => service.getRoom(users[1], room.code), count < 3 ? "ROOM_KICKED" : "ROOM_BLOCKED");
+    if (count < 3) {
+      const rejoined = service.joinRoom(users[1], room.code);
+      assert.equal(rejoined.players.find((player) => player.id === users[1].id)?.lobbyReady, false);
+    }
+  }
+  expectCode(() => service.joinRoom(users[1], room.code), "ROOM_BLOCKED");
+  const otherRoom = service.createRoom(users[1], 2);
+  assert.notEqual(otherRoom.code, room.code);
+  service.leaveRoom(users[1], otherRoom.code);
+  service.joinRoom(users[2], room.code);
+  service.removeRoomPlayer(users[0], room.code, users[2].id, true);
+  expectCode(() => service.joinRoom(users[2], room.code), "ROOM_BLOCKED");
+  expectCode(() => service.removeRoomPlayer(users[0], room.code, users[2].id, false), "PLAYER_NOT_FOUND");
+  service.joinRoom(users[3], room.code);
+  service.setReady(users[0], room.code, true);
+  service.setReady(users[3], room.code, true);
+  service.startRoom(users[0], room.code);
+  expectCode(() => service.removeRoomPlayer(users[0], room.code, users[3].id, true), "ROOM_ALREADY_STARTED");
 });
 
 test("only the host starts and all four maps receive valid starting values", () => {
@@ -324,6 +441,8 @@ test("validates map-specific starting-cell rules without partially saving an inv
   const service = createService();
   const waiting = service.createRoom(users[0], 4);
   service.joinRoom(users[1], waiting.code);
+  service.setReady(users[0], waiting.code, true);
+  service.setReady(users[1], waiting.code, true);
   service.startRoom(users[0], waiting.code);
 
   expectCode(
@@ -355,6 +474,8 @@ test("keeps player boards separate and advances shared dice after every player c
   );
   const waiting = service.createRoom(users[0], 1);
   service.joinRoom(users[1], waiting.code);
+  service.setReady(users[0], waiting.code, true);
+  service.setReady(users[1], waiting.code, true);
   service.startRoom(users[0], waiting.code);
   service.submitInitialBoard(users[0], waiting.code, [1, 2, 3, 4, 5, 6]);
   const started = service.submitInitialBoard(
@@ -369,6 +490,10 @@ test("keeps player boards separate and advances shared dice after every player c
   const firstPlayerBoard = service.getRoom(users[0], waiting.code).board;
   const secondPlayerBoard = service.getRoom(users[1], waiting.code).board;
   assert.notDeepEqual(firstPlayerBoard, secondPlayerBoard);
+  assert.deepEqual(started.players.find((player) => player.id === users[0].id)?.board, firstPlayerBoard);
+  assert.deepEqual(started.players.find((player) => player.id === users[1].id)?.board, secondPlayerBoard);
+  started.players[0].board![0][0] = 6;
+  assert.deepEqual(service.getRoom(users[0], waiting.code).board, firstPlayerBoard);
 
   const afterFirstMove = makeFirstValidMove(
     service,
@@ -463,6 +588,8 @@ test("a host leaving during setup dissolves the room for all players", () => {
   const service = createService();
   const room = service.createRoom(users[0], 2);
   service.joinRoom(users[1], room.code);
+  service.setReady(users[0], room.code, true);
+  service.setReady(users[1], room.code, true);
   service.startRoom(users[0], room.code);
 
   const result = service.leaveRoom(users[0], room.code);
@@ -476,6 +603,8 @@ test("a non-host leaving setup closes a room that no longer has enough players",
   const service = createService();
   const room = service.createRoom(users[0], 1);
   service.joinRoom(users[1], room.code);
+  service.setReady(users[0], room.code, true);
+  service.setReady(users[1], room.code, true);
   service.startRoom(users[0], room.code);
 
   const result = service.leaveRoom(users[1], room.code);
@@ -500,7 +629,21 @@ test("a host or player leaving during a game is removed while the game continues
   assert.equal(makeFirstValidMove(service, users[1], result).phase, "playing");
 });
 
-test("a host disconnecting during a game is removed without ending the game", () => {
+test("advances the round when the last player awaiting a move leaves and two players remain", () => {
+  const service = createService();
+  const waiting = service.createRoom(users[0], 1);
+  service.joinRoom(users[1], waiting.code);
+  service.joinRoom(users[2], waiting.code);
+  const playing = startAndConfigure(service, users[0], waiting.code, users.slice(0, 3), 1);
+  service.skipRound(users[0], waiting.code, playing.round);
+  service.skipRound(users[1], waiting.code, playing.round);
+  const afterLeave = service.leaveRoom(users[2], waiting.code).room!;
+  assert.equal(afterLeave.phase, "playing");
+  assert.equal(afterLeave.round, playing.round + 1);
+  assert.deepEqual(afterLeave.winners, []);
+});
+
+test("a host disconnecting awards the game to the remaining player", () => {
   let time = 0;
   let codeValue = 0;
   const service = new MultiplayerService(
@@ -527,7 +670,9 @@ test("a host disconnecting during a game is removed without ending the game", ()
   time = 160_000;
   service.sweep();
   const state = service.getRoom(users[1], game.code);
-  assert.equal(state.phase, "playing");
+  assert.equal(state.phase, "finished");
+  assert.equal(state.finishReason, "last_player");
+  assert.deepEqual(state.winners, [users[1].id]);
   assert.equal(state.players.find((player) => player.id === users[0].id)?.forfeited, true);
   assert.equal(state.players.find((player) => player.id === users[1].id)?.forfeited, false);
 });
@@ -565,7 +710,8 @@ test("lobby heartbeats do not keep a disconnected room player connected", () => 
   service.getRoom(users[0], waiting.code);
 
   const state = service.getRoom(users[0], waiting.code);
-  assert.equal(state.phase, "playing");
+  assert.equal(state.phase, "finished");
+  assert.deepEqual(state.winners, [users[0].id]);
   assert.equal(
     state.players.find((player) => player.id === users[1].id)?.forfeited,
     true,
@@ -578,6 +724,7 @@ test("a setup player is removed after 60 seconds and remaining players are infor
   const waiting = service.createRoom(users[0], 1);
   service.joinRoom(users[1], waiting.code);
   service.joinRoom(users[2], waiting.code);
+  for (const player of users.slice(0, 3)) service.setReady(player, waiting.code, true);
   service.startRoom(users[0], waiting.code);
   service.submitInitialBoard(users[0], waiting.code, [1, 2, 3, 4, 5, 6]);
 

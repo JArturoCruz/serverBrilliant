@@ -1,10 +1,13 @@
 import "dotenv/config";
 import { randomUUID } from "node:crypto";
+import { createSocket } from "node:dgram";
+import { existsSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import cors from "cors";
 import express from "express";
 import helmet from "helmet";
 import { toNodeHandler } from "better-auth/node";
-import { auth, database } from "./auth.js";
+import { auth, database, initializeDatabase } from "./auth.js";
 import {
   MultiplayerError,
   MultiplayerService,
@@ -13,15 +16,25 @@ import {
 
 const app = express();
 const port = Number.parseInt(process.env.PORT ?? "3000", 10);
+const discoveryPort = Number.parseInt(process.env.DISCOVERY_PORT ?? "38971", 10);
+const webRoot = process.env.BRILLIANT_WEB_ROOT?.trim();
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("PORT no es válido.");
+}
+if (!Number.isInteger(discoveryPort) || discoveryPort < 1 || discoveryPort > 65535) {
+  throw new Error("DISCOVERY_PORT no es válido.");
+}
+if (webRoot && (!isAbsolute(webRoot) || !existsSync(join(webRoot, "index.html")))) {
+  throw new Error("BRILLIANT_WEB_ROOT debe ser una ruta absoluta con una compilación web válida.");
 }
 
 const clientOrigins = (process.env.CLIENT_ORIGINS ?? "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+
+const corsOrigin = clientOrigins.includes("*") ? true : clientOrigins.length > 0 ? clientOrigins : false;
 
 const requestIdPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -67,17 +80,29 @@ app.use((request, response, next) => {
   next();
 });
 
+app.use((request, response, next) => {
+  if (request.method === "OPTIONS" && request.get("access-control-request-private-network") === "true") {
+    response.vary("Access-Control-Request-Private-Network");
+    const origin = request.get("origin");
+    if (origin && (clientOrigins.includes("*") || clientOrigins.includes(origin))) {
+      response.setHeader("Access-Control-Allow-Private-Network", "true");
+    }
+  }
+  next();
+});
+
 app.use(
   cors({
-    origin: clientOrigins.length > 0 ? clientOrigins : false,
+    origin: corsOrigin,
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id", "ngrok-skip-browser-warning"],
     exposedHeaders: ["set-auth-token", "x-request-id", "x-retry-after"],
   }),
 );
 
-app.get("/health", (_request, response) => {
-  response.json({ status: "ok" });
+app.get("/health", (request, response) => {
+  console.log("Health check received from:", request.headers.origin);
+  response.json({ status: "ok", service: "brilliant" });
 });
 
 // Better Auth debe recibir sus solicitudes antes de otros manejadores de body.
@@ -158,6 +183,31 @@ multiplayer.post("/rooms/:code/start", async (request, response) => {
   );
 });
 
+multiplayer.post("/rooms/:code/ready", async (request, response) => {
+  const body = requestObject(request.body);
+  if (typeof body.ready !== "boolean") {
+    throw new MultiplayerError("INVALID_REQUEST", "Indica si estás listo.", 400);
+  }
+  response.json(multiplayerService.setReady(
+    await authenticatedUser(request),
+    request.params.code ?? "",
+    body.ready,
+  ));
+});
+
+multiplayer.post("/rooms/:code/remove-player", async (request, response) => {
+  const body = requestObject(request.body);
+  if (typeof body.playerId !== "string" || body.playerId.length === 0 || typeof body.block !== "boolean") {
+    throw new MultiplayerError("INVALID_REQUEST", "Indica el jugador y la acción.", 400);
+  }
+  response.json(multiplayerService.removeRoomPlayer(
+    await authenticatedUser(request),
+    request.params.code ?? "",
+    body.playerId,
+    body.block,
+  ));
+});
+
 multiplayer.post("/rooms/:code/setup", async (request, response) => {
   const body = requestObject(request.body);
   if (
@@ -224,6 +274,25 @@ multiplayer.post("/rooms/:code/move", async (request, response) => {
 });
 
 app.use("/api/multiplayer", multiplayer);
+if (webRoot) {
+  app.use(
+    helmet.contentSecurityPolicy({
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'wasm-unsafe-eval'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        fontSrc: ["'self'", "data:"],
+        connectSrc: ["'self'", "https:", "http:", "wss:", "ws:"],
+        workerSrc: ["'self'", "blob:"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        frameAncestors: ["'none'"],
+      },
+    }),
+    express.static(webRoot, { index: "index.html", fallthrough: true }),
+  );
+}
 app.use((
   error: unknown,
   request: express.Request,
@@ -259,13 +328,33 @@ app.use((
   });
 });
 
+await initializeDatabase();
+
 const server = app.listen(port, "0.0.0.0", () => {
   console.info(`Brilliant Auth Server escuchando en el puerto ${port}.`);
 });
 
+const discovery = createSocket("udp4");
+let discoveryListening = false;
+discovery.on("listening", () => { discoveryListening = true; });
+discovery.on("close", () => { discoveryListening = false; });
+discovery.on("error", (error) => {
+  console.error("La búsqueda de servidores en la red local no está disponible:", error.message);
+  if (discoveryListening) discovery.close();
+});
+discovery.on("message", (message, remote) => {
+  const match = /^BRILLIANT_DISCOVER_V1:([0-9a-f]{32})$/.exec(message.toString("utf8"));
+  if (!match) return;
+  discovery.send(`BRILLIANT_SERVER_V1:${match[1]}:${port}`, remote.port, remote.address, (error) => {
+    if (error) console.error("No se pudo responder a la búsqueda de servidor:", error.message);
+  });
+});
+discovery.bind(discoveryPort, "0.0.0.0");
+
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
     clearInterval(multiplayerSweep);
+    if (discoveryListening) discovery.close();
     server.close((error) => {
       if (error) {
         console.error("No se pudo cerrar el servidor correctamente.", error);

@@ -1,7 +1,8 @@
 import { emitKeypressEvents } from "node:readline";
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { auth, database } from "./auth.js";
+import { auth, database, initializeDatabase } from "./auth.js";
 
 function promptHidden(label: string): Promise<string> {
   if (!stdin.isTTY) {
@@ -44,24 +45,23 @@ async function main(): Promise<void> {
   if (!stdin.isTTY || !stdout.isTTY) {
     throw new Error("Ejecuta este comando desde una terminal interactiva.");
   }
+  await initializeDatabase();
 
   const prompt = createInterface({ input: stdin, output: stdout });
   let name: string;
-  let email: string;
 
   try {
     name = (await prompt.question("Nombre: ")).trim();
-    email = (await prompt.question("Correo: ")).trim();
   } finally {
     prompt.close();
   }
 
-  const password = await promptHidden("Contraseña (mínimo 12 caracteres, entrada oculta): ");
+  const password = await promptHidden("PIN (6 dígitos, entrada oculta): ");
   const result = await auth.api.signUpEmail({
-    body: { name, email, password },
+    body: { name, username: name, email: `${randomUUID()}@brilliant.invalid`, password },
   });
 
-  console.info(`Usuario registrado: ${result.user.email}`);
+  console.info(`Usuario registrado: ${result.user.name}`);
 }
 
 main()
